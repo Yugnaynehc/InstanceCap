@@ -1,0 +1,7 @@
+*.avi
+*.so
+video/
+result/
+crop/
+data/
+data
