@@ -142,11 +142,9 @@ def draw_cap(frame, cap, x, y):
         i += cut
         n += 1
     # Add some paddings
-    # x -= 5
-    y -= 5
+    x += 2
     # Set proper y paddings for multi lines
     dy = 12
-    y -= dy * n
     for s in sents:
         y += dy
         cv2.putText(frame, s, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, white, 1)
@@ -249,20 +247,19 @@ if __name__ == '__main__':
             #           int(0.8 * by), int(1.2 * (by + bh))]
 
             # set extend square region box length
-            box_length = min(200, 0.5 * min(frame_h, frame_w))
+            box_length = min(3 * max(bw, bh), 0.75 * min(frame_h, frame_w))
             ew = int(max(box_length - bw, 0) / 2)
             eh = int(max(box_length - bh, 0) / 2)
             # Four elements are left, right, top, down
-            extbox = [max(0, bx - ew), min(bx + bw + ew, frame_w),
-                      max(0, by - eh), min(by + bh + eh, frame_h)]
-            # extbox = [max(0, bx - ew), bx + bw + ew,
-            #           max(0, by - eh), by + bh + eh]
-            crop_img = raw_frame[extbox[2]: extbox[3],
-                                 extbox[0]: extbox[1]]
+            extbox = [max(0, bx - ew), min(bx + bw + ew, frame_w - 1),
+                      max(0, by - eh), min(by + bh + eh, frame_h - 1)]
             cv2.rectangle(frame,
                           (extbox[0], extbox[2]),
                           (extbox[1], extbox[3]),
                           grass, 1)
+
+            crop_img = raw_frame[extbox[2]: extbox[3],
+                                 extbox[0]: extbox[1]]
             # cv2.imshow('crop', crop_img)
             # cv2.imwrite('./crop/crop_%d.jpg' % idx, crop_img)
 
