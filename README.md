@@ -7,17 +7,16 @@ This demo project was implemented by [KCFcpp-py-wrapper](https://github.com/uoip
 2. Prepare OTB100 dataset for evaluation
 2. Modify change the load path for load_model() in line 68 of demo.py to correctly load the pretrained model.
 3. Run
-~~~
-   python2 demo.py YOUT_OTB100_ROOT_DIR/TEST_CASE_ROOT_DIR
-~~~
+
+        python2 demo.py YOUR_OTB100_ROOT_DIR/TEST_CASE_ROOT_DIR  
    to see the result, for example:
-~~~
-   python2 demo.py ./data/Walking
-~~~
+
+        python2 demo.py ./data/Walking
+
    
 If you don't have OTB100 dataset, you can modify the source code to adapt to other dataset, and even video captured by webcam. Some code in [KCFcpp-py-wrapper/run.py](https://github.com/uoip/KCFcpp-py-wrapper/blob/master/run.py) may be useful.
 
-If you have powerfull CPU or GPU, you can try smooth version of this demo:
+If you have powerfull CPU or GPU, you can try smooth version of this demo (also need to modify model path):
 ~~~
    python2 demo_smooth.py YOUT_OTB100_ROOT_DIR/TEST_CASE_ROOT_DIR
 ~~~
