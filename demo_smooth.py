@@ -43,11 +43,12 @@ class InstanceCaptioner(object):
         self.onTracking = False
         self.ix, self.iy, self.cx, self.cy = -1, -1, -1, -1
         self.w, self.h = 0, 0
-        self.inteval = 30
         self.capbox = None
 
         self.img_folder = img_folder
+        self.testcase = img_folder.split('/')[-1]
         self.tracker = KCF.kcftracker(True, False, True, True)
+        self.inteval = 30
 
         self.window = cv2.namedWindow('tracking')
         cv2.setMouseCallback('tracking', self.draw_boundingbox)
@@ -90,9 +91,8 @@ class InstanceCaptioner(object):
         temp_img = cv2.imread(temp_img_name)
         self.frame_h, self.frame_w, _ = temp_img.shape
         fourcc = cv2.VideoWriter_fourcc(*'DIVX')
-        self.video = cv2.VideoWriter('./video/%s.avi' % img_folder.split('/')[-1],
-                                     fourcc, 20,
-                                     (self.frame_w, self.frame_h))
+        self.video = cv2.VideoWriter('./video/%s.avi' % self.testcase,
+                                     fourcc, 20, (self.frame_w, self.frame_h))
 
         # Init draw text settings
         self.font = cv2.FONT_HERSHEY_SIMPLEX
@@ -141,7 +141,7 @@ class InstanceCaptioner(object):
 
         elif event == cv2.EVENT_LBUTTONUP:
             self.selectingObject = False
-            if(abs(x - self.ix) > 10 and abs(y - self.iy) > 10):
+            if abs(x - self.ix) > 10 and abs(y - self.iy) > 10:
                 self.w, self.h = abs(x - self.ix), abs(y - self.iy)
                 self.ix, self.iy = min(x, self.ix), min(y, self.iy)
                 self.initTracking = True
@@ -151,7 +151,7 @@ class InstanceCaptioner(object):
 
         elif event == cv2.EVENT_RBUTTONDOWN:
             self.onTracking = False
-            if(self.w > 0):
+            if self.w > 0:
                 self.ix, self.iy = int(x - self.w / 2), int(y - self.h / 2)
                 self.initTracking = True
                 self.cap = None
@@ -214,8 +214,6 @@ class InstanceCaptioner(object):
         im = self.raw_frame[self.capbox[2]:self.capbox[3],
                             self.capbox[0]:self.capbox[1]]
         im = im.astype(np.float32)
-        # mean_color = np.mean(np.mean(im[:30, :], axis=0), axis=0)
-        # self.text_color = self.complement(*mean_color)
         im = cv2.resize(im, (224, 224))  # VGG use 224x224 image size
         im -= self.vgg_mean
         im = im[:, :, [2, 1, 0]]  # convert from BGR to RGB
@@ -238,6 +236,12 @@ class InstanceCaptioner(object):
         '''
         Draw the captioning result on the left top of the frame
         '''
+        # Set proper text color
+        # strip_frame = self.raw_frame[self.capbox[2]:self.capbox[3],
+        #                              self.capbox[0]:self.capbox[1]]
+        # mean_color = np.mean(np.mean(strip_frame[:20], axis=0), axis=0)
+        # self.text_color = self.complement(*mean_color)
+
         # Add some paddings
         x = self.capbox[0] + 2
         y = self.capbox[2]
@@ -255,11 +259,18 @@ class InstanceCaptioner(object):
                 self.cap_image()
             time.sleep(0.5)
 
+    def clean(self):
+        self.cap = None
+        self.capbox = None
+        self.initTracking = False
+        self.onTracking = False
+        cv2.imshow('tracking', self.raw_frame)
+
     def run(self):
         # Using ground truth to init tracking target
-        self.ix, self.iy, self.w, self.h = map(
-            int, re.findall(self.sep_pattern, self.gts[0]))
-        self.initTracking = True
+        # self.ix, self.iy, self.w, self.h = map(
+        #     int, re.findall(self.sep_pattern, self.gts[0]))
+        # self.initTracking = True
         self.narrator.start()
 
         for idx, filename in enumerate(sorted(glob.glob(self.img_folder + '/img/*.jpg'))):
@@ -267,9 +278,28 @@ class InstanceCaptioner(object):
             self.raw_frame = raw_frame
             frame = copy.deepcopy(raw_frame)
             self.frame = frame
-            if(self.selectingObject):
-                cv2.rectangle(frame, (self.ix, self.iy), (self.cx, self.cy), green, 2)
-            elif(self.initTracking):
+            cv2.imshow('tracking', frame)
+
+            if not self.onTracking and not self.initTracking:
+                while True:
+                    if self.selectingObject:
+                        temp_frame = copy.deepcopy(raw_frame)
+                        cv2.rectangle(temp_frame, (self.ix, self.iy),
+                                      (self.cx, self.cy), green, 2)
+                        cv2.imshow('tracking', temp_frame)
+                    # If press 'c', continue tracking
+                    c = cv2.waitKey(self.inteval) & 0xFF
+                    if c == ord('c'):
+                        break
+                    elif c == ord('e'):
+                        self.clean()
+                    # If press 'q', exit this program
+                    elif c == 27 or c == ord('q'):
+                        cv2.destroyAllWindows()
+                        self.video.release()
+                        return
+
+            if self.initTracking:
                 cv2.rectangle(frame, (self.ix, self.iy),
                               (self.ix + self.w, self.iy + self.h), green, 2)
 
@@ -277,7 +307,7 @@ class InstanceCaptioner(object):
 
                 self.initTracking = False
                 self.onTracking = True
-            elif(self.onTracking):
+            if self.onTracking:
                 # frame had better be contiguous
                 bx, by, bw, bh = list(map(int, self.tracker.update(frame)))
                 cv2.rectangle(frame, (bx, by), (bx + bw, by + bh), green, 2)
@@ -288,22 +318,28 @@ class InstanceCaptioner(object):
                               (capbox[0], capbox[2]),
                               (capbox[1], capbox[3]),
                               grass, 1)
+
                 while not self.cap:
                     time.sleep(0.1)
+
                 self.draw_cap()
+
             # Get and show the ground truth
             # gx, gy, gw, gh = map(int, re.findall(self.sep_pattern, self.gts[idx]))
             # cv2.rectangle(frame, (gx, gy), (gx + gw, gy + gh), red, 2)
             cv2.imshow('tracking', frame)
             self.video.write(frame)
             # Save the tracking and captioning result
-            cv2.imwrite('./trackcap/result_%d.jpg' % idx, frame)
+            cv2.imwrite('./trackcap/%s_%d.jpg' % (self.testcase, idx), frame)
 
             c = cv2.waitKey(self.inteval) & 0xFF
             # If press 'q', exit program
             if c == 27 or c == ord('q'):
                 self.video.release()
                 break
+            elif c == ord('e'):
+                self.clean()
+
             # Use only 400 frame (about 20 seconds)
             if idx == 400:
                 self.video.release()
@@ -311,7 +347,6 @@ class InstanceCaptioner(object):
 
         cv2.destroyAllWindows()
         self.video.release()
-
 
 if __name__ == '__main__':
     img_folder = sys.argv[1]
