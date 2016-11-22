@@ -1,7 +1,9 @@
 *.avi
 *.so
 video/
-result/
+trackcap/
 crop/
 data/
 data
+models/
+models

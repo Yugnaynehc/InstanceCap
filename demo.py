@@ -65,9 +65,10 @@ def draw_boundingbox(event, x, y, flags, param):
             cap = None
 
 
-def load_model(model_path=r'/home/feather/Models/model_id1-501-1448236541.t7_cpu.t7'):
+def load_model(model_path=r'./models/model_id1-501-1448236541.t7_cpu.t7'):
     '''
-    Load neuraltalk2 torch pretrain model. Return vocabulary dictionary, CNN model and LSTM model.
+    Load neuraltalk2 torch pretrain model. Return vocabulary dictionary,
+    CNN model and LSTM model.
     '''
     # Load the model checkpoint
     checkpoint = torch.load(model_path)
@@ -275,7 +276,7 @@ if __name__ == '__main__':
         cv2.imshow('tracking', frame)
         video.write(frame)
         # Save the tracking and captioning result
-        cv2.imwrite('./result/result_%d.jpg' % idx, frame)
+        cv2.imwrite('./trackcap/result_%d.jpg' % idx, frame)
 
         c = cv2.waitKey(inteval) & 0xFF
         # If press 'q', exit program
