@@ -44,7 +44,7 @@ class InstanceCaptioner(object):
         self.ix, self.iy, self.cx, self.cy = -1, -1, -1, -1
         self.w, self.h = 0, 0
         self.trackboxes = []
-        self.capboxes = None
+        self.capboxes = []
 
         self.img_folder = img_folder
         self.testcase = img_folder.split('/')[-1]
@@ -66,7 +66,9 @@ class InstanceCaptioner(object):
         self.lstm = self.protos.lm
         self.sample_opts = lua.table(sample_max=1, beam_size=2, temperature=1.0)
 
-        self.cap = None
+        self.caps = []
+        self.cap_start = False
+        self.cap_finish = False
         self.narrator = threading.Thread(target=self.narrate)
         self.narrator.setDaemon(True)
 
@@ -92,7 +94,7 @@ class InstanceCaptioner(object):
         # Init draw text settings
         self.font = cv2.FONT_HERSHEY_SIMPLEX
         self.font_scale = 0.4
-        self.text_color = white
+        self.text_color = red
         self.text_bold = 1
 
     def load_model(self, model_path):
@@ -141,9 +143,10 @@ class InstanceCaptioner(object):
                 self.ix, self.iy = min(x, self.ix), min(y, self.iy)
                 self.initTracking = True
                 self.trackboxes.append([self.ix, self.iy, self.w, self.h])
-                self.cap = None
             else:
                 self.onTracking = False
+        elif event == cv2.EVENT_RBUTTONDOWN:
+            self.clean()
 
     def draw_trackboxes(self, frame):
         '''
@@ -164,13 +167,13 @@ class InstanceCaptioner(object):
             tracker.init(box, self.raw_frame)
             self.trackers.append(tracker)
 
-    def update_trackers(self):
+    def update_trackboxes(self):
         '''
-        Update KCF trackers
+        Update tracking boxes by KCF
         '''
         for idx, tracker in enumerate(self.trackers):
+            # frame had better be contiguous
             self.trackboxes[idx] = list(map(int, tracker.update(self.raw_frame)))
-        # bx, by, bw, bh = list(map(int, self.tracker.update(frame)))
 
     def cal_capbox(self, bx, by, bw, bh):
         '''
@@ -186,13 +189,21 @@ class InstanceCaptioner(object):
                   max(0, by - eh), min(by + bh + eh, self.frame_h - 1)]
         return capbox
 
-    def draw_capboxes(self):
+    def update_capboxes(self):
+        '''
+        Update captioning boxes by cal_capbox()
+        '''
+        self.capboxes = []
+        for tbox in self.trackboxes:
+            self.capboxes.append(self.cal_capbox(*tbox))
+
+    def draw_capboxes(self, frame):
         '''
         For every caption region, draw bouding box
         '''
         for box in self.capboxes:
-            cv2.rectangle(frame, (box[0], box[1]),
-                          (box[0] + box[2], box[1] + box[3]),
+            cv2.rectangle(frame, (box[0], box[2]),
+                          (box[1], box[3]),
                           grass, 1)
 
     @staticmethod
@@ -232,65 +243,89 @@ class InstanceCaptioner(object):
         k = InstanceCaptioner.hilo(b, g, r)
         return tuple(int(k - u) for u in (b, g, r))
 
-    def cap_image(self):
+    def cap_instances(self):
         '''
-        Caption the image!
+        Caption the instances
         '''
-        im = self.raw_frame[self.capbox[2]:self.capbox[3],
-                            self.capbox[0]:self.capbox[1]]
-        im = im.astype(np.float32)
-        im = cv2.resize(im, (224, 224))  # VGG use 224x224 image size
-        im -= self.vgg_mean
-        im = im[:, :, [2, 1, 0]]  # convert from BGR to RGB
-        im = im.transpose(2, 0, 1)  # convert to torch format (first dim is color)
-        im = np.array([im])  # add rank by 1
-        im = torch.fromNumpyArray(im)
-        feats = self.cnn._forward(im)
-        seq = self.lstm._sample(feats, self.sample_opts)
-        seq = [seq[0][i][0] for i in range(16)]
-        self.words = self.decode_sequence(self.vocab, seq)
-        # Split the whole sentence in every 5 words
-        cut = 5
-        i = 0
-        self.cap = []
-        while i < len(self.words):
-            self.cap.append(' '.join(self.words[i:i + cut]))
-            i += cut
+
+        if self.cap_finish:
+            flag = True
+        else:
+            flag = False
+            self.caps = []
+
+        for idx, capbox in enumerate(self.capboxes):
+            im = self.raw_frame[capbox[2]:capbox[3],
+                                capbox[0]:capbox[1]]
+            im = im.astype(np.float32)
+            im = cv2.resize(im, (224, 224))  # VGG use 224x224 image size
+            im -= self.vgg_mean
+            im = im[:, :, [2, 1, 0]]  # convert from BGR to RGB
+            im = im.transpose(2, 0, 1)  # convert to torch format (first dim is color)
+            im = np.array([im])  # add rank by 1
+            im = torch.fromNumpyArray(im)
+            feats = self.cnn._forward(im)
+            seq = self.lstm._sample(feats, self.sample_opts)
+            seq = [seq[0][i][0] for i in range(16)]
+            words = self.decode_sequence(self.vocab, seq)
+            # Split the whole sentence in every 5 words
+            cut = 5
+            i = 0
+            cap = []
+            while i < len(words):
+                cap.append(' '.join(words[i:i + cut]))
+                i += cut
+            if flag:
+                self.caps[idx] = cap
+            else:
+                self.caps.append(cap)
+
+        if self.caps:
+            self.cap_finish = True
 
     def draw_cap(self):
         '''
         Draw the captioning result on the left top of the frame
         '''
-        # Set proper text color
-        # strip_frame = self.raw_frame[self.capbox[2]:self.capbox[3],
-        #                              self.capbox[0]:self.capbox[1]]
-        # mean_color = np.mean(np.mean(strip_frame[:20], axis=0), axis=0)
-        # self.text_color = self.complement(*mean_color)
 
-        # Add some paddings
-        x = self.capbox[0] + 2
-        y = self.capbox[2]
-        # Set proper y paddings for multi lines
-        dy = 12
-        for s in self.cap:
-            y += dy
-            cv2.putText(self.frame, s, (x, y),
-                        self.font, self.font_scale,
-                        self.text_color, self.text_bold)
+        for idx, capbox in enumerate(self.capboxes):
+            # Set proper text color
+            # strip_frame = self.raw_frame[self.capbox[2]:self.capbox[3],
+            #                              self.capbox[0]:self.capbox[1]]
+            # mean_color = np.mean(np.mean(strip_frame[:20], axis=0), axis=0)
+            # self.text_color = self.complement(*mean_color)
+            # Add some paddings
+            x = capbox[0] + 2
+            y = capbox[2]
+            # Set proper y paddings for multi lines
+            dy = 12
+            for s in self.caps[idx]:
+                y += dy
+                cv2.putText(self.frame, s, (x, y),
+                            self.font, self.font_scale,
+                            self.text_color, self.text_bold)
 
     def narrate(self):
+        '''
+        Use NeuralTalk2's model to caption every instance
+        '''
         while True:
-            if self.capbox:
-                self.cap_image()
+            if self.cap_start:
+                self.cap_instances()
             time.sleep(0.5)
 
     def clean(self):
-        self.cap = None
-        self.capbox = None
-        self.trackboxes = []
+        '''
+        Clean all tracking and captioning result
+        '''
+        cv2.imshow('tracking', self.raw_frame)
         self.initTracking = False
         self.onTracking = False
-        cv2.imshow('tracking', self.raw_frame)
+        self.trackboxes = []
+        self.capboxes = []
+        self.cap_start = False
+        # self.caps = []
+        self.cap_finish = False
 
     def run(self):
 
@@ -315,6 +350,9 @@ class InstanceCaptioner(object):
                     # If press 'c', continue tracking
                     c = cv2.waitKey(self.inteval) & 0xFF
                     if c == ord('c'):
+                        self.update_capboxes()
+                        self.cap_finish = False
+                        self.cap_start = True
                         break
                     elif c == ord('e'):
                         self.clean()
@@ -326,33 +364,20 @@ class InstanceCaptioner(object):
 
             if self.initTracking:
                 self.draw_trackboxes(frame)
-                # cv2.rectangle(frame, (self.ix, self.iy),
-                #               (self.ix + self.w, self.iy + self.h), green, 2)
 
-                # self.tracker.init([self.ix, self.iy, self.w, self.h], frame)
                 self.init_trackers()
-
                 self.initTracking = False
                 self.onTracking = True
 
             if self.onTracking:
-                # frame had better be contiguous
-                self.update_trackers()
+                self.update_trackboxes()
+                self.update_capboxes()
+
                 self.draw_trackboxes(frame)
-                # bx, by, bw, bh = list(map(int, self.tracker.update(frame)))
-                # cv2.rectangle(frame, (bx, by), (bx + bw, by + bh), green, 2)
+                self.draw_capboxes(frame)
 
-                # Show and save the (expanded) captioning region
-                # capbox = self.cal_capbox(bx, by, bw, bh)
-                capbox = self.cal_capbox(*self.trackboxes[0])
-                cv2.rectangle(frame,
-                              (capbox[0], capbox[2]),
-                              (capbox[1], capbox[3]),
-                              grass, 1)
-
-                while not self.cap:
+                while not self.cap_finish:
                     time.sleep(0.1)
-
                 self.draw_cap()
 
             cv2.imshow('tracking', frame)
