@@ -93,8 +93,8 @@ class InstanceCaptioner(object):
 
         # Init draw text settings
         self.font = cv2.FONT_HERSHEY_SIMPLEX
-        self.font_scale = 0.4
-        self.text_color = red
+        self.font_scale = 0.45
+        self.text_color = green
         self.text_bold = 1
 
     def load_model(self, model_path):
