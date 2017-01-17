@@ -1,5 +1,5 @@
 '''
-Object tracking, implemented by KCF+NeuralTalk2
+Object tracking, implemented by KCF+im2txt
 '''
 import os
 import re
@@ -11,16 +11,13 @@ import time
 import shutil
 import threading
 import numpy as np
+import scipy.misc
 from easydict import EasyDict
 import KCF
+import tensorflow as tf
+import tensorlayer as tl
+from buildmodel import *
 
-# Import lua and torch module
-import lutorpy as lua
-lua.LuaRuntime(zero_based_index=True)
-lua.require('torch')
-torch.manualSeed(123)
-torch.setdefaulttensortype('torch.FloatTensor')
-lua.require('misc.LanguageModel')
 
 # Define some color name
 white = (255, 255, 255)
@@ -55,16 +52,14 @@ class InstanceCaptioner(object):
 
         # Init captioning module
         if not model_path:
-            self.model_path = r'./models/model_id1-501-1448236541.t7_cpu.t7'
+            self.model_path = r'./models/captioning/train'
         else:
             self.model_path = model_path
-        self.vocab, self.protos = self.load_model(self.model_path)
-
-        self.cnn = self.protos.cnn
-        self.vgg_mean = np.array([103.939, 116.779, 123.68])  # BGR
-
-        self.lstm = self.protos.lm
-        self.sample_opts = lua.table(sample_max=1, beam_size=2, temperature=1.0)
+        self.vocab_file = "./imgdata/processed/word_counts.txt"
+        self.max_caption_length = 20
+        self.n_captions = 1
+        self.top_k = 1
+        self.init_sess()
 
         self.caps = []
         self.cap_start = False
@@ -97,31 +92,33 @@ class InstanceCaptioner(object):
         self.text_color = green
         self.text_bold = 1
 
-    def load_model(self, model_path):
+    def init_sess(self):
         '''
-        Load neuraltalk2 torch pretrain model. Return vocabulary dictionary,
-        CNN model and LSTM model.
+        Load the pretrain model, and init tensorflow session for caption generating
         '''
-        # Load the model checkpoint
-        checkpoint = torch.load(model_path)
+        mode = 'inference'
 
-        # Use opt to restore options
-        opt = EasyDict()
+        # Build the inference graph.
+        self.graph = tf.Graph()
+        with self.graph.as_default():
+            self.images, self.input_seqs, self.target_seqs, self.input_mask, self.input_feed = Build_Inputs(
+                mode, input_file_pattern=None)
 
-        # Extract some options
-        fetch = {'rnn_size', 'input_encoding_size', 'drop_prob_lm',
-                 'cnn_proto', 'cnn_model', 'seq_per_img'}
-        for k in fetch:
-            opt[k] = checkpoint.opt[k]
-        vocab = checkpoint.vocab
-        vocab = {int(k): v for k, v in dict(vocab).items()}
+            self.net_image_embeddings = Build_Image_Embeddings(
+                mode, self.images, train_inception=False)
 
-        protos = checkpoint.protos
-        protos.lm._createClones()
-        protos.cnn._evaluate()
-        protos.lm._evaluate()
+            self.net_seq_embeddings = Build_Seq_Embeddings(self.input_seqs)
 
-        return vocab, protos
+            self.softmax, self.net_img_rnn, self.net_seq_rnn, self.state_feed = Build_Model(
+                mode, self.net_image_embeddings, self.net_seq_embeddings, self.target_seqs, self.input_mask)
+
+            self.saver = tf.train.Saver()
+        self.graph.finalize()
+
+        self.sess = tf.Session(graph=self.graph)
+        checkpoint_path = tf.train.latest_checkpoint(self.model_path)
+        self.saver.restore(self.sess, checkpoint_path)
+        self.vocab = tl.nlp.Vocabulary(self.vocab_file)
 
     def draw_boundingbox(self, event, x, y, flags, param):
         '''
@@ -247,7 +244,6 @@ class InstanceCaptioner(object):
         '''
         Caption the instances
         '''
-
         if self.cap_finish:
             flag = True
         else:
@@ -257,18 +253,41 @@ class InstanceCaptioner(object):
         for idx, capbox in enumerate(self.capboxes):
             im = self.raw_frame[capbox[2]:capbox[3],
                                 capbox[0]:capbox[1]]
-            im = im.astype(np.float32)
-            im = cv2.resize(im, (224, 224))  # VGG use 224x224 image size
-            im -= self.vgg_mean
-            im = im[:, :, [2, 1, 0]]  # convert from BGR to RGB
-            im = im.transpose(2, 0, 1)  # convert to torch format (first dim is color)
-            im = np.array([im])  # add rank by 1
-            im = torch.fromNumpyArray(im)
-            feats = self.cnn._forward(im)
-            seq = self.lstm._sample(feats, self.sample_opts)
-            seq = [seq[0][i][0] for i in range(16)]
-            words = self.decode_sequence(self.vocab, seq)
+            filename = 'outfile.jpg'
+            scipy.misc.imsave(filename, im)
+            f = tf.gfile.GFile(filename, "r")
+            encoded_image = f.read()
+            # im = cv2.resize(im, (224, 224))  # VGG use 224x224 image size
+            # im -= self.vgg_mean
+            # im = im[:, :, [2, 1, 0]]  # convert from BGR to RGB
+            # im = im.transpose(2, 0, 1)  # convert to torch format (first dim is color)
+            # im = np.array([im])  # add rank by 1
+            # im = torch.fromNumpyArray(im)
+            # feats = self.cnn._forward(im)
+            # seq = self.lstm._sample(feats, self.sample_opts)
+            # seq = [seq[0][i][0] for i in range(16)]
+            # words = self.decode_sequence(self.vocab, seq)
             # Split the whole sentence in every 5 words
+            init_state = self.sess.run(self.net_img_rnn.final_state,
+                                       feed_dict={"image_feed:0": encoded_image})
+            f.close()
+            for _ in range(self.n_captions):
+                state = np.hstack((init_state.c, init_state.h))  # (1, 1024)
+                a_id = self.vocab.start_id
+                words = []
+                for _ in range(self.max_caption_length - 1):
+                    softmax_output, state = self.sess.run([self.softmax, self.net_seq_rnn.final_state],
+                                                          feed_dict={self.input_feed: [a_id],
+                                                                     self.state_feed: state,
+                                                                     })
+                    state = np.hstack((state.c, state.h))
+                    a_id = tl.nlp.sample_top(softmax_output[0], top_k=self.top_k)
+                    word = self.vocab.id_to_word(a_id)
+                    if a_id == self.vocab.end_id:
+                        break
+                    words.append(word)
+
+                print(words)
             cut = 5
             i = 0
             cap = []
@@ -300,7 +319,6 @@ class InstanceCaptioner(object):
             # Set proper y paddings for multi lines
             dy = 12
             for s in self.caps[idx]:
-                print(s)
                 y += dy
                 cv2.putText(self.frame, s, (x, y),
                             self.font, self.font_scale,
@@ -401,6 +419,7 @@ class InstanceCaptioner(object):
 
         cv2.destroyAllWindows()
         self.video.release()
+
 
 if __name__ == '__main__':
     img_folder = sys.argv[1]

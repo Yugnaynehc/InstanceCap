@@ -1,5 +1,7 @@
 *.avi
 *.so
+*.pyc
+*.jpg
 video/
 trackcap/
 crop/
@@ -8,3 +10,5 @@ data
 models/
 temp/
 models
+imgdata/
+imgdata
