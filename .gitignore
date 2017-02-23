@@ -1,5 +1,7 @@
+*.pyc
 *.avi
 *.so
+outfile.jpg
 video/
 trackcap/
 crop/
