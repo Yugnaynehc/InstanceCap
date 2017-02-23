@@ -121,7 +121,7 @@ def process_image(mode, encoded_image, thread_id=0):
         # only logged in thread 0.
         def image_summary(name, image):
             if not thread_id:
-                tf.image_summary(name, tf.expand_dims(image, 0))
+                tf.summary.image(name, tf.expand_dims(image, 0))
 
         # Decode image into a float32 Tensor of shape [?, ?, 3] with values in [0, 1).
         with tf.name_scope("decode"):  # , values=[encoded_image]):   # DH modify

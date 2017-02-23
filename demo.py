@@ -55,7 +55,7 @@ class InstanceCaptioner(object):
             self.model_path = r'./models/captioning/train'
         else:
             self.model_path = model_path
-        self.vocab_file = "./imgdata/processed/word_counts.txt"
+        self.vocab_file = "./word_counts.txt"
         self.max_caption_length = 20
         self.n_captions = 1
         self.top_k = 1
@@ -253,24 +253,9 @@ class InstanceCaptioner(object):
         for idx, capbox in enumerate(self.capboxes):
             im = self.raw_frame[capbox[2]:capbox[3],
                                 capbox[0]:capbox[1]]
-            filename = 'outfile.jpg'
-            scipy.misc.imsave(filename, im)
-            f = tf.gfile.GFile(filename, "r")
-            encoded_image = f.read()
-            # im = cv2.resize(im, (224, 224))  # VGG use 224x224 image size
-            # im -= self.vgg_mean
-            # im = im[:, :, [2, 1, 0]]  # convert from BGR to RGB
-            # im = im.transpose(2, 0, 1)  # convert to torch format (first dim is color)
-            # im = np.array([im])  # add rank by 1
-            # im = torch.fromNumpyArray(im)
-            # feats = self.cnn._forward(im)
-            # seq = self.lstm._sample(feats, self.sample_opts)
-            # seq = [seq[0][i][0] for i in range(16)]
-            # words = self.decode_sequence(self.vocab, seq)
-            # Split the whole sentence in every 5 words
+            encoded_image = cv2.imencode('.jpg', im)[1].tostring()
             init_state = self.sess.run(self.net_img_rnn.final_state,
                                        feed_dict={"image_feed:0": encoded_image})
-            f.close()
             for _ in range(self.n_captions):
                 state = np.hstack((init_state.c, init_state.h))  # (1, 1024)
                 a_id = self.vocab.start_id
