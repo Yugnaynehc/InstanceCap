@@ -1,5 +1,5 @@
 '''
-Object tracking, implemented by KCF+NeuralTalk2
+Instance Captioning, implemented by KCF+im2txt
 '''
 import os
 import re
@@ -7,19 +7,17 @@ import cv2
 import sys
 import copy
 import glob
+import time
 import shutil
+import threading
 import numpy as np
-from time import time
+import scipy.misc
 from easydict import EasyDict
-import KCF
+import kcftracker as KCF
+import tensorflow as tf
+import tensorlayer as tl
+from buildmodel import *
 
-# Import lua and torch module
-import lutorpy as lua
-lua.LuaRuntime(zero_based_index=True)
-lua.require('torch')
-torch.manualSeed(123)
-torch.setdefaulttensortype('torch.FloatTensor')
-lua.require('misc.LanguageModel')
 
 # Define some color name
 white = (255, 255, 255)
@@ -32,261 +30,398 @@ blue = (255, 0, 0)
 yellow = (0, 255, 255)
 
 
-def draw_boundingbox(event, x, y, flags, param):
-    '''
-    Mouse callback function; for init or change tracking target.
-    '''
-    global selectingObject, initTracking, onTracking, ix, iy, cx, cy, w, h, cap
+class InstanceCaptioner(object):
 
-    if event == cv2.EVENT_LBUTTONDOWN:
-        selectingObject = True
-        onTracking = False
-        ix, iy = x, y
-        cx, cy = x, y
+    def __init__(self, img_folder, model_path=None):
 
-    elif event == cv2.EVENT_MOUSEMOVE:
-        cx, cy = x, y
+        # Init tracking module
+        self.selectingObject = False
+        self.initTracking = False
+        self.onTracking = False
+        self.ix, self.iy, self.cx, self.cy = -1, -1, -1, -1
+        self.w, self.h = 0, 0
+        self.trackboxes = []
+        self.capboxes = []
 
-    elif event == cv2.EVENT_LBUTTONUP:
-        selectingObject = False
-        if(abs(x - ix) > 10 and abs(y - iy) > 10):
-            w, h = abs(x - ix), abs(y - iy)
-            ix, iy = min(x, ix), min(y, iy)
-            initTracking = True
-            cap = None
+        self.img_folder = img_folder
+        self.testcase = img_folder.split('/')[-1]
+        self.inteval = 30
+
+        self.window = cv2.namedWindow('tracking')
+        cv2.setMouseCallback('tracking', self.draw_boundingbox)
+
+        # Init captioning module
+        if not model_path:
+            self.model_path = r'./models/captioning/train'
         else:
-            onTracking = False
+            self.model_path = model_path
+        self.vocab_file = "./imgdata/processed/word_counts.txt"
+        self.max_caption_length = 20
+        self.n_captions = 1
+        self.top_k = 1
+        self.init_sess()
 
-    elif event == cv2.EVENT_RBUTTONDOWN:
-        onTracking = False
-        if(w > 0):
-            ix, iy = int(x - w / 2), int(y - h / 2)
-            initTracking = True
-            cap = None
+        self.caps = []
+        self.cap_start = False
+        self.cap_finish = False
+        self.narrator = threading.Thread(target=self.narrate)
+        self.narrator.setDaemon(True)
 
+        # Init 'trackcap' folder to save tracking and captioning result
+        if os.path.exists('./trackcap'):
+            shutil.rmtree('./trackcap')
+            os.mkdir('./trackcap')
+        else:
+            os.mkdir('./trackcap')
 
-def load_model(model_path=r'./models/model_id1-501-1448236541.t7_cpu.t7'):
-    '''
-    Load neuraltalk2 torch pretrain model. Return vocabulary dictionary,
-    CNN model and LSTM model.
-    '''
-    # Load the model checkpoint
-    checkpoint = torch.load(model_path)
+        # Init 'video' folder to save merged result for every test case
+        if not os.path.exists('./video'):
+            os.mkdir('./video')
 
-    # Use opt to restore options
-    opt = EasyDict()
+        # Init video saver for merging result to avi video
+        temp_img_name = img_folder + '/img/' + os.listdir(img_folder + '/img')[0]
+        temp_img = cv2.imread(temp_img_name)
+        self.frame_h, self.frame_w, _ = temp_img.shape
+        fourcc = cv2.VideoWriter_fourcc(*'DIVX')
+        self.video = cv2.VideoWriter('./video/%s.avi' % self.testcase,
+                                     fourcc, 20, (self.frame_w, self.frame_h))
 
-    # Extract some options
-    fetch = {'rnn_size', 'input_encoding_size', 'drop_prob_lm',
-             'cnn_proto', 'cnn_model', 'seq_per_img'}
-    for k in fetch:
-        opt[k] = checkpoint.opt[k]
-    vocab = checkpoint.vocab
-    vocab = {int(k): v for k, v in dict(vocab).items()}
+        # Init draw text settings
+        self.font = cv2.FONT_HERSHEY_SIMPLEX
+        self.font_scale = 0.45
+        self.text_color = green
+        self.text_bold = 1
 
-    protos = checkpoint.protos
-    protos.lm._createClones()
-    protos.cnn._evaluate()
-    protos.lm._evaluate()
+    def init_sess(self):
+        '''
+        Load the pretrain model, and init tensorflow session for caption generating
+        '''
+        mode = 'inference'
 
-    return vocab, protos
+        # Build the inference graph.
+        self.graph = tf.Graph()
+        with self.graph.as_default():
+            self.images, self.input_seqs, self.target_seqs, self.input_mask, self.input_feed = Build_Inputs(
+                mode, input_file_pattern=None)
 
+            self.net_image_embeddings = Build_Image_Embeddings(
+                mode, self.images, train_inception=False)
 
-def decode_sequence(ix_to_word, seq):
-    '''
-    Decode word idx from seq, and return as a captioning sentence
-    '''
-    try:
-        out = []
-        for ix in seq:
-            if ix == 0:
-                return out
-            word = ix_to_word[ix]
-            out.append(word)
-    except Exception, e:
-        pass
-    return out
+            self.net_seq_embeddings = Build_Seq_Embeddings(self.input_seqs)
 
+            self.softmax, self.net_img_rnn, self.net_seq_rnn, self.state_feed = Build_Model(
+                mode, self.net_image_embeddings, self.net_seq_embeddings, self.target_seqs, self.input_mask)
 
-def cap_image(im):
-    '''
-    Caption the image!
-    '''
-    global cnn, lstm, vocab, vgg_mean, sample_opts
-    im = im.astype(np.float32)
-    im = cv2.resize(im, (224, 224))  # VGG use 224x224 image size
-    im -= vgg_mean
-    im = im[:, :, [2, 1, 0]]  # convert from BGR to RGB
-    im = im.transpose(2, 0, 1)  # convert to torch format (first dim is color)
-    im = np.array([im])  # add rank by 1
-    im = torch.fromNumpyArray(im)
-    feats = cnn._forward(im)
-    seq = lstm._sample(feats, sample_opts)
-    seq = [seq[0][i][0] for i in range(16)]
-    words = decode_sequence(vocab, seq)
-    sentence = ' '.join(words)
-    return sentence
+            self.saver = tf.train.Saver()
+        self.graph.finalize()
 
+        self.sess = tf.Session(graph=self.graph)
+        checkpoint_path = tf.train.latest_checkpoint(self.model_path)
+        self.saver.restore(self.sess, checkpoint_path)
+        self.vocab = tl.nlp.Vocabulary(self.vocab_file)
 
-def draw_cap(frame, cap, x, y):
-    '''
-    Draw the captioning result on the left top of the frame
-    '''
-    # Split the whole sentence in every 5 words
-    cut = 5
-    n = 0  # count for lines
-    i = 0
-    sents = []
-    words = cap.split(' ')
-    while i < len(words):
-        sents.append(' '.join(words[i:i + cut]))
-        i += cut
-        n += 1
-    # Add some paddings
-    x += 2
-    # Set proper y paddings for multi lines
-    dy = 12
-    for s in sents:
-        y += dy
-        cv2.putText(frame, s, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, white, 1)
+    def draw_boundingbox(self, event, x, y, flags, param):
+        '''
+        Mouse callback function; for init or change tracking target.
+        '''
+        if event == cv2.EVENT_LBUTTONDOWN:
+            self.selectingObject = True
+            self.onTracking = False
+            self.ix, self.iy = x, y
+            self.cx, self.cy = x, y
 
-# Init captioning module
-vocab, protos = load_model()
+        elif event == cv2.EVENT_MOUSEMOVE:
+            self.cx, self.cy = x, y
 
-cnn = protos.cnn
-vgg_mean = np.array([103.939, 116.779, 123.68])  # BGR
+        elif event == cv2.EVENT_LBUTTONUP:
+            self.selectingObject = False
+            if abs(x - self.ix) > 10 and abs(y - self.iy) > 10:
+                self.w, self.h = abs(x - self.ix), abs(y - self.iy)
+                self.ix, self.iy = min(x, self.ix), min(y, self.iy)
+                self.initTracking = True
+                self.trackboxes.append([self.ix, self.iy, self.w, self.h])
+            else:
+                self.onTracking = False
+        elif event == cv2.EVENT_RBUTTONDOWN:
+            self.clean()
 
-lstm = protos.lm
-sample_opts = lua.table(sample_max=1, beam_size=2, temperature=1.0)
+    def draw_trackboxes(self, frame):
+        '''
+        Draw each tracking target's bounding box
+        '''
+        for box in self.trackboxes:
+            cv2.rectangle(frame, (box[0], box[1]),
+                          (box[0] + box[2], box[1] + box[3]),
+                          green, 2)
 
+    def init_trackers(self):
+        '''
+        For every bounding object, set a KCF tracker
+        '''
+        self.trackers = []
+        for box in self.trackboxes:
+            tracker = self.tracker = KCF.KCFTracker()
+            tracker.init(box, self.raw_frame)
+            self.trackers.append(tracker)
 
-# Init tracking module
-selectingObject = False
-initTracking = False
-onTracking = False
-ix, iy, cx, cy = -1, -1, -1, -1
-w, h = 0, 0
-
-inteval = 30
-duration = 0.01
-
-if __name__ == '__main__':
-    # The four params for kcftracker are
-    # hog, fixed_window, multiscale, lab
-    tracker = KCF.kcftracker(True, False, True, True)
-
-    cv2.namedWindow('tracking')
-    # cv2.namedWindow('crop')
-    cv2.setMouseCallback('tracking', draw_boundingbox)
-
-    # item = sys.argv[1]
-    # img_folder = './data/%s/' % item
-    img_folder = sys.argv[1]
-    gt_file = img_folder + '/groundtruth_rect.txt'
-    f = open(gt_file)
-    sep_pattern = r'[\d]+'
-    gts = f.readlines()
-    ix, iy, w, h = map(int, re.findall(sep_pattern, gts[0]))
-    initTracking = True
-
-    # Init 'crop' folder to save detailed tracking region
-    if os.path.exists('./crop'):
-        shutil.rmtree('./crop')
-        os.mkdir('./crop')
-    else:
-        os.mkdir('./crop')
-
-    # Init 'trackcap' folder to save tracking and captioning result
-    if os.path.exists('./trackcap'):
-        shutil.rmtree('./trackcap')
-        os.mkdir('./trackcap')
-    else:
-        os.mkdir('./trackcap')
-
-    # Init 'video' folder to save merged result for every test case
-    if not os.path.exists('./video'):
-        os.mkdir('./video')
-
-    # Init video saver for merging result to avi video
-    temp_img_name = img_folder + '/img/' + os.listdir(img_folder + '/img')[0]
-    temp_img = cv2.imread(temp_img_name)
-    frame_h, frame_w, _ = temp_img.shape
-    fourcc = cv2.VideoWriter_fourcc(*'DIVX')
-    video = cv2.VideoWriter('./video/%s.avi' % img_folder.split('/')[-1],
-                            fourcc, 20,
-                            (frame_w, frame_h))
-
-    cap = None
-    for idx, filename in enumerate(sorted(glob.glob(img_folder + '/img/*.jpg'))):
-        raw_frame = cv2.imread(filename)
-        frame = copy.deepcopy(raw_frame)
-        if(selectingObject):
-            cv2.rectangle(frame, (ix, iy), (cx, cy), green, 2)
-        elif(initTracking):
-            cv2.rectangle(frame, (ix, iy), (ix + w, iy + h), green, 2)
-
-            tracker.init([ix, iy, w, h], frame)
-
-            initTracking = False
-            onTracking = True
-        elif(onTracking):
-            t0 = time()
+    def update_trackboxes(self):
+        '''
+        Update tracking boxes by KCF
+        '''
+        for idx, tracker in enumerate(self.trackers):
             # frame had better be contiguous
-            bx, by, bw, bh = list(map(int, tracker.update(frame)))
-            t1 = time()
+            self.trackboxes[idx] = list(map(int, tracker.update(self.raw_frame)))
 
-            duration = 0.8 * duration + 0.2 * (t1 - t0)
-            # duration = t1-t0
-            # cv2.putText(frame, 'FPS: ' + str(1 / duration)[:4].strip('.'),
-            #             (8, 20), cv2.FONT_HERSHEY_SIMPLEX,
-            #             0.6, (0, 0, 255), 2)
-            cv2.rectangle(frame, (bx, by), (bx + bw, by + bh), green, 2)
+    def cal_capbox(self, bx, by, bw, bh):
+        '''
+        Calculate extended square region box for captioning
+        '''
+        # Set extend square region box length
+        box_length = min(max(200, 3 * max(bw, bh)), 0.75 *
+                         min(self.frame_h, self.frame_w))
+        ew = int(max(box_length - bw, 0) / 2)
+        eh = int(max(box_length - bh, 0) / 2)
+        # Four elements are left, right, top, down
+        capbox = [max(0, bx - ew), min(bx + bw + ew, self.frame_w - 1),
+                  max(0, by - eh), min(by + bh + eh, self.frame_h - 1)]
+        return capbox
 
-            # Show and save the (expanded) tracking region
-            # Four elements are left, right, top, down
-            # extbox = [int(0.8 * bx), int(1.2 * (bx + bw)),
-            #           int(0.8 * by), int(1.2 * (by + bh))]
+    def update_capboxes(self):
+        '''
+        Update captioning boxes by cal_capbox()
+        '''
+        self.capboxes = []
+        for tbox in self.trackboxes:
+            self.capboxes.append(self.cal_capbox(*tbox))
 
-            # set extend square region box length
-            box_length = min(3 * max(bw, bh), 0.75 * min(frame_h, frame_w))
-            ew = int(max(box_length - bw, 0) / 2)
-            eh = int(max(box_length - bh, 0) / 2)
-            # Four elements are left, right, top, down
-            extbox = [max(0, bx - ew), min(bx + bw + ew, frame_w - 1),
-                      max(0, by - eh), min(by + bh + eh, frame_h - 1)]
-            cv2.rectangle(frame,
-                          (extbox[0], extbox[2]),
-                          (extbox[1], extbox[3]),
+    def draw_capboxes(self, frame):
+        '''
+        For every caption region, draw bouding box
+        '''
+        for box in self.capboxes:
+            cv2.rectangle(frame, (box[0], box[2]),
+                          (box[1], box[3]),
                           grass, 1)
 
-            crop_img = raw_frame[extbox[2]: extbox[3],
-                                 extbox[0]: extbox[1]]
-            # cv2.imshow('crop', crop_img)
-            # cv2.imwrite('./crop/crop_%d.jpg' % idx, crop_img)
+    @staticmethod
+    def decode_sequence(ix_to_word, seq):
+        '''
+        Decode word idx from seq, and return as a captioning sentence
+        '''
+        try:
+            out = []
+            for ix in seq:
+                if ix == 0:
+                    return out
+                word = ix_to_word[ix]
+                out.append(word)
+        except Exception, e:
+            pass
+        return out
 
-            # Update caption in every 30 frame
-            if not cap or idx % 30 == 0:
-                cap = cap_image(crop_img)
-            # Put the captioning result in frame
-            draw_cap(frame, cap, extbox[0], extbox[2])
+    @staticmethod
+    def hilo(a, b, c):
+        '''
+        Sum of the min & max of (a, b, c)
+        '''
+        if c < b:
+            b, c = c, b
+        if b < a:
+            a, b = b, a
+        if c < b:
+            b, c = c, b
+        return a + c
 
-        # Get and show the ground truth
-        # gx, gy, gw, gh = map(int, re.findall(sep_pattern, gts[idx]))
-        # cv2.rectangle(frame, (gx, gy), (gx + gw, gy + gh), red, 2)
-        cv2.imshow('tracking', frame)
-        video.write(frame)
-        # Save the tracking and captioning result
-        cv2.imwrite('./trackcap/result_%d.jpg' % idx, frame)
+    @staticmethod
+    def complement(b, g, r):
+        '''
+        Calculate complement color for given (b, g, r)
+        '''
+        k = InstanceCaptioner.hilo(b, g, r)
+        return tuple(int(k - u) for u in (b, g, r))
 
-        c = cv2.waitKey(inteval) & 0xFF
-        # If press 'q', exit program
-        if c == 27 or c == ord('q'):
-            video.release()
-            break
-        # Use only 360 frame (about 18 seconds)
-        if idx == 360:
-            video.release()
-            break
+    def cap_instances(self):
+        '''
+        Caption the instances
+        '''
+        if self.cap_finish:
+            flag = True
+        else:
+            flag = False
+            self.caps = []
 
-    cv2.destroyAllWindows()
-    video.release()
+        for idx, capbox in enumerate(self.capboxes):
+            im = self.raw_frame[capbox[2]:capbox[3],
+                                capbox[0]:capbox[1]]
+            filename = 'outfile.jpg'
+            scipy.misc.imsave(filename, im)
+            f = tf.gfile.GFile(filename, "r")
+            encoded_image = f.read()
+            # im = cv2.resize(im, (224, 224))  # VGG use 224x224 image size
+            # im -= self.vgg_mean
+            # im = im[:, :, [2, 1, 0]]  # convert from BGR to RGB
+            # im = im.transpose(2, 0, 1)  # convert to torch format (first dim is color)
+            # im = np.array([im])  # add rank by 1
+            # im = torch.fromNumpyArray(im)
+            # feats = self.cnn._forward(im)
+            # seq = self.lstm._sample(feats, self.sample_opts)
+            # seq = [seq[0][i][0] for i in range(16)]
+            # words = self.decode_sequence(self.vocab, seq)
+            # Split the whole sentence in every 5 words
+            init_state = self.sess.run(self.net_img_rnn.final_state,
+                                       feed_dict={"image_feed:0": encoded_image})
+            f.close()
+            for _ in range(self.n_captions):
+                state = np.hstack((init_state.c, init_state.h))  # (1, 1024)
+                a_id = self.vocab.start_id
+                words = []
+                for _ in range(self.max_caption_length - 1):
+                    softmax_output, state = self.sess.run([self.softmax, self.net_seq_rnn.final_state],
+                                                          feed_dict={self.input_feed: [a_id],
+                                                                     self.state_feed: state,
+                                                                     })
+                    state = np.hstack((state.c, state.h))
+                    a_id = tl.nlp.sample_top(softmax_output[0], top_k=self.top_k)
+                    word = self.vocab.id_to_word(a_id)
+                    if a_id == self.vocab.end_id:
+                        break
+                    words.append(word)
+
+                print(words)
+            cut = 5
+            i = 0
+            cap = []
+            while i < len(words):
+                cap.append(' '.join(words[i:i + cut]))
+                i += cut
+            if flag:
+                self.caps[idx] = cap
+            else:
+                self.caps.append(cap)
+
+        if self.caps:
+            self.cap_finish = True
+
+    def draw_cap(self):
+        '''
+        Draw the captioning result on the left top of the frame
+        '''
+
+        for idx, capbox in enumerate(self.capboxes):
+            # Set proper text color
+            # strip_frame = self.raw_frame[self.capbox[2]:self.capbox[3],
+            #                              self.capbox[0]:self.capbox[1]]
+            # mean_color = np.mean(np.mean(strip_frame[:20], axis=0), axis=0)
+            # self.text_color = self.complement(*mean_color)
+            # Add some paddings
+            x = capbox[0] + 2
+            y = capbox[2]
+            # Set proper y paddings for multi lines
+            dy = 12
+            for s in self.caps[idx]:
+                y += dy
+                cv2.putText(self.frame, s, (x, y),
+                            self.font, self.font_scale,
+                            self.text_color, self.text_bold)
+
+    def narrate(self):
+        '''
+        Use NeuralTalk2's model to caption every instance
+        '''
+        while True:
+            if self.cap_start:
+                self.cap_instances()
+            time.sleep(0.5)
+
+    def clean(self):
+        '''
+        Clean all tracking and captioning result
+        '''
+        cv2.imshow('tracking', self.raw_frame)
+        self.initTracking = False
+        self.onTracking = False
+        self.trackboxes = []
+        self.capboxes = []
+        self.cap_start = False
+        # self.caps = []
+        self.cap_finish = False
+
+    def run(self):
+
+        self.narrator.start()
+
+        for idx, filename in enumerate(sorted(glob.glob(self.img_folder + '/img/*.jpg'))):
+            raw_frame = cv2.imread(filename)
+            self.raw_frame = raw_frame
+            frame = copy.deepcopy(raw_frame)
+            self.frame = frame
+            cv2.imshow('tracking', frame)
+
+            if not self.onTracking and not self.initTracking:
+                self.clean()
+                while True:
+                    if self.selectingObject:
+                        temp_frame = copy.deepcopy(raw_frame)
+                        self.draw_trackboxes(temp_frame)
+                        cv2.rectangle(temp_frame, (self.ix, self.iy),
+                                      (self.cx, self.cy), green, 2)
+                        cv2.imshow('tracking', temp_frame)
+                    # If press 'c', continue tracking
+                    c = cv2.waitKey(self.inteval) & 0xFF
+                    if c == ord('c'):
+                        self.update_capboxes()
+                        self.cap_finish = False
+                        self.cap_start = True
+                        break
+                    elif c == ord('e'):
+                        self.clean()
+                    # If press 'q', exit this program
+                    elif c == 27 or c == ord('q'):
+                        cv2.destroyAllWindows()
+                        self.video.release()
+                        return
+
+            if self.initTracking:
+                self.draw_trackboxes(frame)
+
+                self.init_trackers()
+                self.initTracking = False
+                self.onTracking = True
+
+            if self.onTracking:
+                self.update_trackboxes()
+                self.update_capboxes()
+
+                self.draw_trackboxes(frame)
+                self.draw_capboxes(frame)
+
+                while not self.cap_finish:
+                    time.sleep(0.1)
+                self.draw_cap()
+
+            cv2.imshow('tracking', frame)
+            self.video.write(frame)
+            # Save the tracking and captioning result
+            cv2.imwrite('./trackcap/%s_%d.jpg' % (self.testcase, idx), frame)
+
+            c = cv2.waitKey(self.inteval) & 0xFF
+            # If press 'q', exit program
+            if c == 27 or c == ord('q'):
+                self.video.release()
+                break
+            elif c == ord('e'):
+                self.clean()
+
+            # Use only 400 frame (about 20 seconds)
+            if idx == 400:
+                self.video.release()
+                break
+
+        cv2.destroyAllWindows()
+        self.video.release()
+
+
+if __name__ == '__main__':
+    img_folder = sys.argv[1]
+    inscap = InstanceCaptioner(img_folder)
+    inscap.run()
